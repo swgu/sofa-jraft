@@ -10,8 +10,10 @@
     <artifactId>jraft-rheakv</artifactId>
     <packaging>pom</packaging>
     <name>jraft-rheakv ${project.version}</name>
+
     <modules>
         <module>rheakv-core</module>
         <module>rheakv-pd</module>
+        <module>rheakv-server</module>
     </modules>
 </project>

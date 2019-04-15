@@ -1,0 +1,21 @@
+<runtime>
+    <!-- Target -->
+    <archive name="${project.artifactId}-${project.version}.tar.gz"/>
+
+    <!-- shell scripts -->
+    <fileSet to="/bin">
+        <directory path="${basedir}/bin">
+        </directory>
+    </fileSet>
+    <fileSet to="/conf">
+        <directory path="${basedir}/conf">
+        </directory>
+    </fileSet>
+
+    <!-- libs -->
+    <artifactSet to="lib">
+        <artifact id="${project.groupId}:jraft-rheakv-core:${project.version}"/>
+        <artifact id="${project.groupId}:jraft-rheakv-pd:${project.version}"/>
+    </artifactSet>
+
+</runtime>

@@ -1,0 +1,24 @@
+clusterName: kepler_rheakv
+placementDriverOptions:
+  fake: true
+  cliOptions:
+    rpcProcessorThreadPoolSize: 4
+storeEngineOptions:
+  rocksDBOptions:
+    sync: true
+    #dbPath: ${DB_PATH}
+    dbPath: data/rhea_db
+
+  #raftDataPath: ${RAFT_PATH}
+  raftDataPath: data/raft_data
+
+  serverAddress:
+    ip: 127.0.0.1
+    port: 8181
+
+  regionEngineOptionsList:
+    - {regionId: 1, endKey: g, nodeOptions: { timerPoolSize: 1, rpcProcessorThreadPoolSize: 4 } }
+    - {regionId: 2, startKey: g, nodeOptions: { timerPoolSize: 1, rpcProcessorThreadPoolSize: 4 } }
+  leastKeysOnSplit: 10
+
+initialServerList: 127.0.0.1:8181
