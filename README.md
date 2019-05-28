@@ -1,3 +1,8 @@
+# 说明
+
+本分支 forked from https://github.com/sofastack/sofa-jraft
+主要用于创建 RheaKV 独立服务的 Docker 镜像
+
 # SOFAJRaft
 
 [![Build Status](https://travis-ci.com/alipay/sofa-jraft.svg?branch=master)](https://travis-ci.com/alipay/sofa-jraft)
