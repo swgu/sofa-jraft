@@ -23,6 +23,9 @@ function print_usage() {
 }
 
 function create_config() {
+    # set local host server ip
+    sed -i "s/127.0.0.1/$(hostname -f)/g" $CONFIG_FILE
+
     if [ $SERVERS -gt 1 ]; then
         if [[ $HOST =~ (.*)-([0-9]+)$ ]]; then
         NAME=${BASH_REMATCH[1]}
@@ -31,9 +34,6 @@ function create_config() {
             echo "Fialed to parse name and ordinal of Pod"
             exit 1
         fi
-
-        # set local host server ip
-        sed -i "s/127.0.0.1/$(hostname -f)/g" $CONFIG_FILE
 
         # init server list
         SERVER_LIST="initialServerList: "
