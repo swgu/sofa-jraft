@@ -17,7 +17,6 @@
 package com.alipay.sofa.jraft.rhea.storage;
 
 import java.io.Serializable;
-import java.util.Arrays;
 import java.util.List;
 
 import com.alipay.sofa.jraft.rhea.util.Pair;
@@ -155,10 +154,10 @@ public class KVOperation implements Serializable {
         return new KVOperation(BytesUtil.EMPTY_BYTES, BytesUtil.EMPTY_BYTES, nodeExecutor, NODE_EXECUTE);
     }
 
-    public static KVOperation createKeyLockRequest(final byte[] key,
+    public static KVOperation createKeyLockRequest(final byte[] key, final byte[] fencingKey,
                                                    final Pair<Boolean, DistributedLock.Acquirer> acquirerPair) {
         Requires.requireNonNull(key, "key");
-        return new KVOperation(key, BytesUtil.EMPTY_BYTES, acquirerPair, KEY_LOCK);
+        return new KVOperation(key, fencingKey, acquirerPair, KEY_LOCK);
     }
 
     public static KVOperation createKeyLockReleaseRequest(final byte[] key, final DistributedLock.Acquirer acquirer) {
@@ -177,10 +176,9 @@ public class KVOperation implements Serializable {
         return new KVOperation(BytesUtil.EMPTY_BYTES, BytesUtil.EMPTY_BYTES, keys, MULTI_GET);
     }
 
-    public static KVOperation createScan(final byte[] startKey, final byte[] endKey, final int limit) {
-        Requires.requireNonNull(startKey, "startKey");
-        Requires.requireNonNull(endKey, "endKey");
-        return new KVOperation(startKey, endKey, limit, SCAN);
+    public static KVOperation createScan(final byte[] startKey, final byte[] endKey, final int limit,
+                                         final boolean returnValue) {
+        return new KVOperation(startKey, endKey, Pair.of(limit, returnValue), SCAN);
     }
 
     public static KVOperation createGetAndPut(final byte[] key, final byte[] value) {
@@ -200,9 +198,9 @@ public class KVOperation implements Serializable {
         return new KVOperation(seqKey, BytesUtil.EMPTY_BYTES, null, RESET_SEQUENCE);
     }
 
-    public static KVOperation createRangeSplit(final byte[] splitKey, final Pair<Long, Long> regionIds) {
+    public static KVOperation createRangeSplit(final byte[] splitKey, final long currentRegionId, final long newRegionId) {
         Requires.requireNonNull(splitKey, "splitKey");
-        return new KVOperation(splitKey, BytesUtil.EMPTY_BYTES, regionIds, RANGE_SPLIT);
+        return new KVOperation(splitKey, BytesUtil.EMPTY_BYTES, Pair.of(currentRegionId, newRegionId), RANGE_SPLIT);
     }
 
     public KVOperation() {
@@ -227,10 +225,6 @@ public class KVOperation implements Serializable {
         return key;
     }
 
-    public void setKey(byte[] key) {
-        this.key = key;
-    }
-
     public byte[] getValue() {
         return value;
     }
@@ -239,84 +233,59 @@ public class KVOperation implements Serializable {
         return value;
     }
 
-    public void setValue(byte[] value) {
-        this.value = value;
+    public byte[] getFencingKey() {
+        return value;
     }
 
     public int getStep() {
         return (Integer) this.attach;
     }
 
-    public void setStep(int step) {
-        this.attach = step;
-    }
-
     public byte getOp() {
         return op;
     }
 
-    public void setOp(byte op) {
-        this.op = op;
-    }
-
     @SuppressWarnings("unchecked")
     public List<KVEntry> getEntries() {
-        return List.class.cast(this.attach);
-    }
-
-    public void setEntries(List<KVEntry> entries) {
-        this.attach = entries;
+        return (List<KVEntry>) this.attach;
     }
 
     public NodeExecutor getNodeExecutor() {
-        return NodeExecutor.class.cast(this.attach);
-    }
-
-    public void setNodeExecutor(NodeExecutor nodeExecutor) {
-        this.attach = nodeExecutor;
+        return (NodeExecutor) this.attach;
     }
 
     @SuppressWarnings("unchecked")
     public Pair<Boolean, DistributedLock.Acquirer> getAcquirerPair() {
-        return Pair.class.cast(this.attach);
-    }
-
-    public void setAcquirerPair(Pair<Boolean, DistributedLock.Acquirer> acquirerPair) {
-        this.attach = acquirerPair;
+        return (Pair<Boolean, DistributedLock.Acquirer>) this.attach;
     }
 
     public DistributedLock.Acquirer getAcquirer() {
-        return DistributedLock.Acquirer.class.cast(this.attach);
-    }
-
-    public void setAcquirer(DistributedLock.Acquirer acquirer) {
-        this.attach = acquirer;
+        return (DistributedLock.Acquirer) this.attach;
     }
 
     @SuppressWarnings("unchecked")
     public List<byte[]> getKeyList() {
-        return List.class.cast(this.attach);
-    }
-
-    public void setKeyList(List<byte[]> keyList) {
-        this.attach = keyList;
+        return (List<byte[]>) this.attach;
     }
 
     @SuppressWarnings("unchecked")
-    public Pair<Long, Long> getRegionIds() {
-        return Pair.class.cast(this.attach);
+    public long getCurrentRegionId() {
+        return ((Pair<Long, Long>) this.attach).getKey();
     }
 
-    public void setRegionIds(Pair<Long, Long> regionIds) {
-        this.attach = regionIds;
+    @SuppressWarnings("unchecked")
+    public long getNewRegionId() {
+        return ((Pair<Long, Long>) this.attach).getValue();
     }
 
-    public void setLimit(int limit) {
-        this.attach = limit;
-    }
-
+    @SuppressWarnings("unchecked")
     public int getLimit() {
-        return Integer.class.cast(this.attach);
+        return ((Pair<Integer, Boolean>) this.attach).getKey();
+    }
+
+    @SuppressWarnings("unchecked")
+    public boolean isReturnValue() {
+        return ((Pair<Integer, Boolean>) this.attach).getValue();
     }
 
     public static String opName(KVOperation op) {
@@ -364,7 +333,7 @@ public class KVOperation implements Serializable {
 
     @Override
     public String toString() {
-        return "KVOperation{" + "key=" + Arrays.toString(key) + ", value=" + Arrays.toString(value) + ", attach="
+        return "KVOperation{" + "key=" + BytesUtil.toHex(key) + ", value=" + BytesUtil.toHex(value) + ", attach="
                + attach + ", op=" + op + '}';
     }
 }

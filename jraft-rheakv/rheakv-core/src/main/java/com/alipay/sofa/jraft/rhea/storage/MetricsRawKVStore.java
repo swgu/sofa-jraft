@@ -94,6 +94,12 @@ public class MetricsRawKVStore implements RawKVStore {
     }
 
     @Override
+    public void scan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe, final boolean returnValue,
+                     final KVStoreClosure closure) {
+        scan(startKey, endKey, Integer.MAX_VALUE, readOnlySafe, returnValue, closure);
+    }
+
+    @Override
     public void scan(final byte[] startKey, final byte[] endKey, final int limit, final KVStoreClosure closure) {
         scan(startKey, endKey, limit, true, closure);
     }
@@ -101,8 +107,14 @@ public class MetricsRawKVStore implements RawKVStore {
     @Override
     public void scan(final byte[] startKey, final byte[] endKey, final int limit, final boolean readOnlySafe,
                      final KVStoreClosure closure) {
+        scan(startKey, endKey, limit, readOnlySafe, true, closure);
+    }
+
+    @Override
+    public void scan(final byte[] startKey, final byte[] endKey, final int limit, final boolean readOnlySafe,
+                     final boolean returnValue, final KVStoreClosure closure) {
         final KVStoreClosure c = metricsAdapter(closure, SCAN, 0, 0);
-        this.rawKVStore.scan(startKey, endKey, limit, readOnlySafe, c);
+        this.rawKVStore.scan(startKey, endKey, limit, readOnlySafe, returnValue, c);
     }
 
     @Override
@@ -153,11 +165,11 @@ public class MetricsRawKVStore implements RawKVStore {
     }
 
     @Override
-    public void tryLockWith(final byte[] key, final boolean keepLease, final DistributedLock.Acquirer acquirer,
-                            final KVStoreClosure closure) {
+    public void tryLockWith(final byte[] key, final byte[] fencingKey, final boolean keepLease,
+                            final DistributedLock.Acquirer acquirer, final KVStoreClosure closure) {
         // 'keysCount' and 'bytesWritten' can't be provided with exact numbers, but I endured
         final KVStoreClosure c = metricsAdapter(closure, KEY_LOCK, 2, 0);
-        this.rawKVStore.tryLockWith(key, keepLease, acquirer, c);
+        this.rawKVStore.tryLockWith(key, fencingKey, keepLease, acquirer, c);
     }
 
     @Override

@@ -67,12 +67,18 @@ public class Utils {
     /**
      * Global thread pool to run closure.
      */
-    private static ThreadPoolExecutor CLOSURE_EXECUTOR               = ThreadPoolUtil.newThreadPool("CLOSURE_EXECUTOR",
-                                                                         true, MIN_CLOSURE_EXECUTOR_POOL_SIZE,
-                                                                         MAX_CLOSURE_EXECUTOR_POOL_SIZE, 60L,
-                                                                         new SynchronousQueue<>(),
-                                                                         new NamedThreadFactory(
-                                                                             "JRaft-Closure-Executor-", true));
+    private static ThreadPoolExecutor CLOSURE_EXECUTOR               = ThreadPoolUtil
+                                                                         .newBuilder()
+                                                                         .poolName("JRAFT_CLOSURE_EXECUTOR")
+                                                                         .enableMetric(true)
+                                                                         .coreThreads(MIN_CLOSURE_EXECUTOR_POOL_SIZE)
+                                                                         .maximumThreads(MAX_CLOSURE_EXECUTOR_POOL_SIZE)
+                                                                         .keepAliveSeconds(60L)
+                                                                         .workQueue(new SynchronousQueue<>())
+                                                                         .threadFactory(
+                                                                             new NamedThreadFactory(
+                                                                                 "JRaft-Closure-Executor-", true))
+                                                                         .build();
 
     private static final Pattern      GROUP_ID_PATTER                = Pattern.compile("^[a-zA-Z][a-zA-Z0-9\\-_]*$");
 
@@ -98,6 +104,9 @@ public class Utils {
      * Run closure with OK status in thread pool.
      */
     public static Future<?> runClosureInThread(final Closure done) {
+        if (done == null) {
+            return null;
+        }
         return runClosureInThread(done, Status.OK());
     }
 
@@ -174,7 +183,15 @@ public class Utils {
     /**
      * Default init and expand buffer size, it can be set by -Djraft.byte_buf.size=n, default 1024.
      */
-    public static final int RAFT_DATA_BUF_SIZE = Integer.parseInt(System.getProperty("jraft.byte_buf.size", "1024"));
+    public static final int RAFT_DATA_BUF_SIZE            = Integer.parseInt(System.getProperty("jraft.byte_buf.size",
+                                                              "1024"));
+
+    /**
+     * Default max {@link ByteBufferCollector} size per thread for recycle, it can be set by
+     * -Djraft.max_collector_size_per_thread, default 256
+     */
+    public static final int MAX_COLLECTOR_SIZE_PER_THREAD = Integer.parseInt(System.getProperty(
+                                                              "jraft.max_collector_size_per_thread", "256"));
 
     /**
      * Expand byte buffer for 1024 bytes.

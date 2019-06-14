@@ -16,12 +16,10 @@
  */
 package com.alipay.sofa.jraft.rhea.storage;
 
-import java.io.File;
-import java.io.FileOutputStream;
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.zip.ZipOutputStream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,21 +31,21 @@ import com.alipay.sofa.jraft.core.StateMachineAdapter;
 import com.alipay.sofa.jraft.error.RaftError;
 import com.alipay.sofa.jraft.rhea.LeaderStateListener;
 import com.alipay.sofa.jraft.rhea.StoreEngine;
+import com.alipay.sofa.jraft.rhea.errors.Errors;
 import com.alipay.sofa.jraft.rhea.errors.IllegalKVOperationException;
 import com.alipay.sofa.jraft.rhea.errors.StoreCodecException;
+import com.alipay.sofa.jraft.rhea.metadata.Region;
 import com.alipay.sofa.jraft.rhea.metrics.KVMetrics;
 import com.alipay.sofa.jraft.rhea.serialization.Serializer;
 import com.alipay.sofa.jraft.rhea.serialization.Serializers;
-import com.alipay.sofa.jraft.rhea.util.Pair;
-import com.alipay.sofa.jraft.rhea.util.RecycleUtil;
 import com.alipay.sofa.jraft.rhea.util.StackTraceUtil;
-import com.alipay.sofa.jraft.rhea.util.ZipUtil;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotReader;
 import com.alipay.sofa.jraft.storage.snapshot.SnapshotWriter;
+import com.alipay.sofa.jraft.util.BytesUtil;
+import com.alipay.sofa.jraft.util.RecycleUtil;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 
-import static com.alipay.sofa.jraft.entity.LocalFileMetaOutter.LocalFileMeta;
 import static com.alipay.sofa.jraft.rhea.metrics.KVMetricNames.STATE_MACHINE_APPLY_QPS;
 import static com.alipay.sofa.jraft.rhea.metrics.KVMetricNames.STATE_MACHINE_BATCH_WRITE;
 
@@ -58,83 +56,98 @@ import static com.alipay.sofa.jraft.rhea.metrics.KVMetricNames.STATE_MACHINE_BAT
  */
 public class KVStoreStateMachine extends StateMachineAdapter {
 
-    private static final Logger             LOG              = LoggerFactory.getLogger(KVStoreStateMachine.class);
+    private static final Logger             LOG        = LoggerFactory.getLogger(KVStoreStateMachine.class);
 
-    private static final String             SNAPSHOT_DIR     = "kv";
-    private static final String             SNAPSHOT_ARCHIVE = "kv.zip";
-
-    private final List<LeaderStateListener> listeners        = new CopyOnWriteArrayList<>();
-    private final AtomicLong                leaderTerm       = new AtomicLong(-1L);
-    private final Serializer                serializer       = Serializers.getDefault();
-    private final long                      regionId;
+    private final List<LeaderStateListener> listeners  = new CopyOnWriteArrayList<>();
+    private final AtomicLong                leaderTerm = new AtomicLong(-1L);
+    private final Serializer                serializer = Serializers.getDefault();
+    private final Region                    region;
     private final StoreEngine               storeEngine;
     private final BatchRawKVStore<?>        rawKVStore;
+    private final KVStoreSnapshotFile       storeSnapshotFile;
     private final Meter                     applyMeter;
     private final Histogram                 batchWriteHistogram;
 
-    public KVStoreStateMachine(long regionId, StoreEngine storeEngine) {
-        this.regionId = regionId;
+    public KVStoreStateMachine(Region region, StoreEngine storeEngine) {
+        this.region = region;
         this.storeEngine = storeEngine;
         this.rawKVStore = storeEngine.getRawKVStore();
-        final String regionStr = String.valueOf(this.regionId);
+        this.storeSnapshotFile = KVStoreSnapshotFileFactory.getKVStoreSnapshotFile(this.rawKVStore);
+        final String regionStr = String.valueOf(this.region.getId());
         this.applyMeter = KVMetrics.meter(STATE_MACHINE_APPLY_QPS, regionStr);
         this.batchWriteHistogram = KVMetrics.histogram(STATE_MACHINE_BATCH_WRITE, regionStr);
     }
 
     @Override
     public void onApply(final Iterator it) {
-        int stCount = 0;
-        KVStateOutputList kvStates = KVStateOutputList.newInstance();
-        while (it.hasNext()) {
-            KVOperation kvOp;
-            final KVClosureAdapter done = (KVClosureAdapter) it.done();
-            if (done != null) {
-                kvOp = done.getOperation();
-            } else {
-                final byte[] data = it.getData().array();
-                try {
-                    kvOp = this.serializer.readObject(data, KVOperation.class);
-                } catch (final Throwable t) {
-                    throw new StoreCodecException("Decode operation error", t);
+        int index = 0;
+        int applied = 0;
+        try {
+            KVStateOutputList kvStates = KVStateOutputList.newInstance();
+            while (it.hasNext()) {
+                KVOperation kvOp;
+                final KVClosureAdapter done = (KVClosureAdapter) it.done();
+                if (done != null) {
+                    kvOp = done.getOperation();
+                } else {
+                    final ByteBuffer buf = it.getData();
+                    try {
+                        if (buf.hasArray()) {
+                            kvOp = this.serializer.readObject(buf.array(), KVOperation.class);
+                        } else {
+                            kvOp = this.serializer.readObject(buf, KVOperation.class);
+                        }
+                    } catch (final Throwable t) {
+                        ++index;
+                        throw new StoreCodecException("Decode operation error", t);
+                    }
                 }
+                final KVState first = kvStates.getFirstElement();
+                if (first != null && !first.isSameOp(kvOp)) {
+                    applied += batchApplyAndRecycle(first.getOpByte(), kvStates);
+                    kvStates = KVStateOutputList.newInstance();
+                }
+                kvStates.add(KVState.of(kvOp, done));
+                ++index;
+                it.next();
             }
-            final KVState first = kvStates.getFirstElement();
-            if (first != null && !first.isSameOp(kvOp)) {
-                batchApplyAndRecycle(first.getOpByte(), kvStates);
-                kvStates = KVStateOutputList.newInstance();
+            if (!kvStates.isEmpty()) {
+                final KVState first = kvStates.getFirstElement();
+                assert first != null;
+                applied += batchApplyAndRecycle(first.getOpByte(), kvStates);
             }
-            kvStates.add(KVState.of(kvOp, done));
-            ++stCount;
-            it.next();
+        } catch (final Throwable t) {
+            LOG.error("StateMachine meet critical error: {}.", StackTraceUtil.stackTrace(t));
+            it.setErrorAndRollback(index - applied, new Status(RaftError.ESTATEMACHINE,
+                "StateMachine meet critical error: %s.", t.getMessage()));
+        } finally {
+            // metrics: qps
+            this.applyMeter.mark(applied);
         }
-        if (!kvStates.isEmpty()) {
-            final KVState first = kvStates.getFirstElement();
-            assert first != null;
-            batchApplyAndRecycle(first.getOpByte(), kvStates);
-        }
-
-        // metrics: qps
-        this.applyMeter.mark(stCount);
     }
 
-    private void batchApplyAndRecycle(final byte opByte, final KVStateOutputList kvStates) {
+    private int batchApplyAndRecycle(final byte opByte, final KVStateOutputList kvStates) {
         try {
-            if (kvStates.isEmpty()) {
-                return;
+            final int size = kvStates.size();
+
+            if (size == 0) {
+                return 0;
             }
+
             if (!KVOperation.isValidOp(opByte)) {
                 throw new IllegalKVOperationException("Unknown operation: " + opByte);
             }
 
             // metrics: op qps
-            final Meter opApplyMeter = KVMetrics.meter(STATE_MACHINE_APPLY_QPS, String.valueOf(this.regionId),
+            final Meter opApplyMeter = KVMetrics.meter(STATE_MACHINE_APPLY_QPS, String.valueOf(this.region.getId()),
                 KVOperation.opName(opByte));
-            final int size = kvStates.size();
             opApplyMeter.mark(size);
             this.batchWriteHistogram.update(size);
 
             // do batch apply
             batchApply(opByte, kvStates);
+
+            return size;
         } finally {
             RecycleUtil.recycle(kvStates);
         }
@@ -196,24 +209,31 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     }
 
     private void doSplit(final KVStateOutputList kvStates) {
+        final byte[] parentKey = this.region.getStartKey();
         for (final KVState kvState : kvStates) {
             final KVOperation op = kvState.getOp();
-            final Pair<Long, Long> regionIds = op.getRegionIds();
-            this.storeEngine.doSplit(regionIds.getKey(), regionIds.getValue(), op.getKey(), kvState.getDone());
+            final long currentRegionId = op.getCurrentRegionId();
+            final long newRegionId = op.getNewRegionId();
+            final byte[] splitKey = op.getKey();
+            final KVStoreClosure closure = kvState.getDone();
+            try {
+                this.rawKVStore.initFencingToken(parentKey, splitKey);
+                this.storeEngine.doSplit(currentRegionId, newRegionId, splitKey, closure);
+            } catch (final Exception e) {
+                LOG.error("Fail to split, regionId={}, newRegionId={}, splitKey={}.", currentRegionId, newRegionId,
+                    BytesUtil.toHex(splitKey));
+                if (closure != null) {
+                    // closure is null on follower node
+                    closure.setError(Errors.STORAGE_ERROR);
+                    closure.run(new Status(RaftError.EIO, e.getMessage()));
+                }
+            }
         }
     }
 
     @Override
     public void onSnapshotSave(final SnapshotWriter writer, final Closure done) {
-        final String snapshotPath = writer.getPath() + File.separator + SNAPSHOT_DIR;
-        try {
-            final LocalFileMeta meta = this.rawKVStore.onSnapshotSave(snapshotPath);
-            this.storeEngine.getSnapshotExecutor().execute(() -> doCompressSnapshot(writer, meta, done));
-        } catch (final Throwable t) {
-            LOG.error("Fail to save snapshot at {}, {}.", snapshotPath, StackTraceUtil.stackTrace(t));
-            done.run(new Status(RaftError.EIO, "Fail to save snapshot at %s, error is %s", snapshotPath,
-                    t.getMessage()));
-        }
+        this.storeSnapshotFile.save(writer, done, this.region.copy(), this.storeEngine.getSnapshotExecutor());
     }
 
     @Override
@@ -222,37 +242,7 @@ public class KVStoreStateMachine extends StateMachineAdapter {
             LOG.warn("Leader is not supposed to load snapshot.");
             return false;
         }
-        final LocalFileMeta meta = (LocalFileMeta) reader.getFileMeta(SNAPSHOT_ARCHIVE);
-        if (meta == null) {
-            LOG.error("Can't find kv snapshot file at {}.", reader.getPath());
-            return false;
-        }
-        try {
-            ZipUtil.unzipFile(reader.getPath() + File.separator + SNAPSHOT_ARCHIVE, reader.getPath());
-            this.rawKVStore.onSnapshotLoad(reader.getPath() + File.separator + SNAPSHOT_DIR, meta);
-            return true;
-        } catch (final Throwable t) {
-            LOG.error("Fail to load snapshot: {}.", StackTraceUtil.stackTrace(t));
-            return false;
-        }
-    }
-
-    private void doCompressSnapshot(final SnapshotWriter writer, final LocalFileMeta meta, final Closure done) {
-        final String backupPath = writer.getPath() + File.separator + SNAPSHOT_DIR;
-        try {
-            try (final ZipOutputStream out = new ZipOutputStream(new FileOutputStream(writer.getPath() + File.separator
-                                                                                      + SNAPSHOT_ARCHIVE))) {
-                ZipUtil.compressDirectoryToZipFile(writer.getPath(), SNAPSHOT_DIR, out);
-            }
-            if (writer.addFile(SNAPSHOT_ARCHIVE, meta)) {
-                done.run(Status.OK());
-            } else {
-                done.run(new Status(RaftError.EIO, "Fail to add snapshot file: %s", backupPath));
-            }
-        } catch (final Throwable t) {
-            LOG.error("Fail to save snapshot at {}, {}.", backupPath, StackTraceUtil.stackTrace(t));
-            done.run(new Status(RaftError.EIO, "Fail to save snapshot at %s, error is %s", backupPath, t.getMessage()));
-        }
+        return this.storeSnapshotFile.load(reader, this.region.copy());
     }
 
     @Override
@@ -293,6 +283,6 @@ public class KVStoreStateMachine extends StateMachineAdapter {
     }
 
     public long getRegionId() {
-        return regionId;
+        return this.region.getId();
     }
 }

@@ -25,20 +25,17 @@ import com.alipay.sofa.jraft.Lifecycle;
 import com.alipay.sofa.jraft.Status;
 import com.alipay.sofa.jraft.error.RaftError;
 import com.alipay.sofa.jraft.rhea.errors.Errors;
+import com.alipay.sofa.jraft.rhea.errors.StorageException;
 import com.alipay.sofa.jraft.rhea.metrics.KVMetrics;
 import com.alipay.sofa.jraft.rhea.util.StackTraceUtil;
-import com.alipay.sofa.jraft.util.BytesUtil;
 import com.codahale.metrics.Timer;
 
-import static com.alipay.sofa.jraft.entity.LocalFileMetaOutter.LocalFileMeta;
 import static com.alipay.sofa.jraft.rhea.metrics.KVMetricNames.DB_TIMER;
 
 /**
  * @author jiachun.fjc
  */
 public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
-
-    protected static final byte[] LOCK_FENCING_KEY = BytesUtil.writeUtf8("LOCK_FENCING_KEY");
 
     @Override
     public void get(final byte[] key, final KVStoreClosure closure) {
@@ -62,8 +59,20 @@ public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
     }
 
     @Override
+    public void scan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe, final boolean returnValue,
+                     final KVStoreClosure closure) {
+        scan(startKey, endKey, Integer.MAX_VALUE, readOnlySafe, returnValue, closure);
+    }
+
+    @Override
     public void scan(final byte[] startKey, final byte[] endKey, final int limit, final KVStoreClosure closure) {
         scan(startKey, endKey, limit, true, closure);
+    }
+
+    @Override
+    public void scan(final byte[] startKey, final byte[] endKey, final int limit, final boolean readOnlySafe,
+                     final KVStoreClosure closure) {
+        scan(startKey, endKey, limit, readOnlySafe, true, closure);
     }
 
     @Override
@@ -80,10 +89,14 @@ public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
             if (nodeExecutor != null) {
                 nodeExecutor.execute(new Status(RaftError.EIO, "Fail to [EXECUTE]"), isLeader);
             }
-            setFailure(closure, "Fail to [EXECUTE]");
+            setCriticalError(closure, "Fail to [EXECUTE]", e);
         } finally {
             timeCtx.stop();
         }
+    }
+
+    public long getSafeEndValueForSequence(final long startVal, final int step) {
+        return Math.max(startVal, Long.MAX_VALUE - step < startVal ? Long.MAX_VALUE : startVal + step);
     }
 
     /**
@@ -96,9 +109,13 @@ public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
      */
     public abstract byte[] jumpOver(final byte[] startKey, final long distance);
 
-    public abstract LocalFileMeta onSnapshotSave(final String snapshotPath) throws Exception;
-
-    public abstract void onSnapshotLoad(final String snapshotPath, final LocalFileMeta meta) throws Exception;
+    /**
+     * Init the fencing token of new region.
+     *
+     * @param parentKey the fencing key of parent region
+     * @param childKey  the fencing key of new region
+     */
+    public abstract void initFencingToken(final byte[] parentKey, final byte[] childKey);
 
     // static methods
     //
@@ -106,6 +123,13 @@ public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
         return KVMetrics.timer(DB_TIMER, opName).time();
     }
 
+    /**
+     * Sets success, if current node is a leader, reply to
+     * client success with result data response.
+     *
+     * @param closure callback
+     * @param data    result data to reply to client
+     */
     static void setSuccess(final KVStoreClosure closure, final Object data) {
         if (closure != null) {
             // closure is null on follower node
@@ -114,11 +138,63 @@ public abstract class BaseRawKVStore<T> implements RawKVStore, Lifecycle<T> {
         }
     }
 
+    /**
+     * Sets failure, if current node is a leader, reply to
+     * client failure response.
+     *
+     * @param closure callback
+     * @param message error message
+     */
     static void setFailure(final KVStoreClosure closure, final String message) {
         if (closure != null) {
             // closure is null on follower node
             closure.setError(Errors.STORAGE_ERROR);
             closure.run(new Status(RaftError.EIO, message));
+        }
+    }
+
+    /**
+     * Sets critical error and halt the state machine.
+     *
+     * If current node is a leader, first reply to client
+     * failure response.
+     *
+     * @param closure callback
+     * @param message error message
+     * @param error   critical error
+     */
+    static void setCriticalError(final KVStoreClosure closure, final String message, final Throwable error) {
+        setClosureError(closure);
+        // Will call closure#run in FSMCaller
+        if (error != null) {
+            throw new StorageException(message, error);
+        }
+    }
+
+    /**
+     * Sets critical error and halt the state machine.
+     *
+     * If current node is a leader, first reply to client
+     * failure response.
+     *
+     * @param closures callback list
+     * @param message  error message
+     * @param error    critical error
+     */
+    static void setCriticalError(final List<KVStoreClosure> closures, final String message, final Throwable error) {
+        for (final KVStoreClosure closure : closures) {
+            // Will call closure#run in FSMCaller
+            setClosureError(closure);
+        }
+        if (error != null) {
+            throw new StorageException(message, error);
+        }
+    }
+
+    static void setClosureError(final KVStoreClosure closure) {
+        if (closure != null) {
+            // closure is null on follower node
+            closure.setError(Errors.STORAGE_ERROR);
         }
     }
 }

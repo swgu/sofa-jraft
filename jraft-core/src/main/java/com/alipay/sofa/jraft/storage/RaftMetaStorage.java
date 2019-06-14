@@ -18,6 +18,7 @@ package com.alipay.sofa.jraft.storage;
 
 import com.alipay.sofa.jraft.Lifecycle;
 import com.alipay.sofa.jraft.entity.PeerId;
+import com.alipay.sofa.jraft.option.RaftMetaStorageOptions;
 
 /**
  * Raft metadata storage service.
@@ -26,7 +27,7 @@ import com.alipay.sofa.jraft.entity.PeerId;
  *
  * 2018-Mar-12 3:54:21 PM
  */
-public interface RaftMetaStorage extends Lifecycle<Void>, Storage {
+public interface RaftMetaStorage extends Lifecycle<RaftMetaStorageOptions>, Storage {
 
     /**
      * Set current term.

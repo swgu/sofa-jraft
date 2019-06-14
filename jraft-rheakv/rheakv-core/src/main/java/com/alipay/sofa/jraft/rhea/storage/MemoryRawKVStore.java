@@ -16,104 +16,71 @@
  */
 package com.alipay.sofa.jraft.rhea.storage;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
-import org.apache.commons.io.FileUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.alipay.sofa.jraft.rhea.metadata.Region;
 import com.alipay.sofa.jraft.rhea.options.MemoryDBOptions;
-import com.alipay.sofa.jraft.rhea.serialization.Serializer;
-import com.alipay.sofa.jraft.rhea.serialization.Serializers;
+import com.alipay.sofa.jraft.rhea.storage.MemoryKVStoreSnapshotFile.SequenceDB;
 import com.alipay.sofa.jraft.rhea.util.ByteArray;
 import com.alipay.sofa.jraft.rhea.util.Lists;
 import com.alipay.sofa.jraft.rhea.util.Maps;
 import com.alipay.sofa.jraft.rhea.util.Pair;
+import com.alipay.sofa.jraft.rhea.util.RegionHelper;
 import com.alipay.sofa.jraft.rhea.util.StackTraceUtil;
 import com.alipay.sofa.jraft.rhea.util.concurrent.DistributedLock;
-import com.alipay.sofa.jraft.util.Bits;
 import com.alipay.sofa.jraft.util.BytesUtil;
 import com.codahale.metrics.Timer;
 
-import static com.alipay.sofa.jraft.entity.LocalFileMetaOutter.LocalFileMeta;
+import static com.alipay.sofa.jraft.rhea.storage.MemoryKVStoreSnapshotFile.FencingKeyDB;
+import static com.alipay.sofa.jraft.rhea.storage.MemoryKVStoreSnapshotFile.LockerDB;
+import static com.alipay.sofa.jraft.rhea.storage.MemoryKVStoreSnapshotFile.Segment;
+import static com.alipay.sofa.jraft.rhea.storage.MemoryKVStoreSnapshotFile.TailIndex;
 
 /**
  * @author jiachun.fjc
  */
 public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
 
-    private static final Logger                    LOG             = LoggerFactory.getLogger(MemoryRawKVStore.class);
+    private static final Logger                          LOG          = LoggerFactory.getLogger(MemoryRawKVStore.class);
 
-    private static final byte                      DELIMITER       = (byte) ',';
-    private static final Comparator<byte[]>        COMPARATOR      = BytesUtil.getDefaultByteArrayComparator();
+    private static final byte                            DELIMITER    = (byte) ',';
+    private static final Comparator<byte[]>              COMPARATOR   = BytesUtil.getDefaultByteArrayComparator();
 
-    // this rw_lock is for memory_kv_iterator
-    private final ReadWriteLock                    readWriteLock   = new ReentrantReadWriteLock();
+    private final ConcurrentNavigableMap<byte[], byte[]> defaultDB    = new ConcurrentSkipListMap<>(COMPARATOR);
+    private final Map<ByteArray, Long>                   sequenceDB   = new ConcurrentHashMap<>();
+    private final Map<ByteArray, Long>                   fencingKeyDB = new ConcurrentHashMap<>();
+    private final Map<ByteArray, DistributedLock.Owner>  lockerDB     = new ConcurrentHashMap<>();
 
-    private final AtomicLong                       databaseVersion = new AtomicLong(0);
-    private final Serializer                       serializer      = Serializers.getDefault();
-
-    private ConcurrentNavigableMap<byte[], byte[]> defaultDB;
-    private Map<ByteArray, Long>                   sequenceDB;
-    private Map<ByteArray, Long>                   fencingKeyDB;
-    private Map<ByteArray, DistributedLock.Owner>  lockerDB;
-
-    private MemoryDBOptions                        opts;
+    private volatile MemoryDBOptions                     opts;
 
     @Override
     public boolean init(final MemoryDBOptions opts) {
-        final Lock writeLock = this.readWriteLock.writeLock();
-        writeLock.lock();
-        try {
-            final ConcurrentNavigableMap<byte[], byte[]> defaultDB = new ConcurrentSkipListMap<>(COMPARATOR);
-            final Map<ByteArray, Long> sequenceDB = Maps.newHashMap();
-            final Map<ByteArray, Long> fencingKeyDB = Maps.newHashMap();
-            final Map<ByteArray, DistributedLock.Owner> lockerDB = Maps.newHashMap();
-            openMemoryDB(opts, defaultDB, sequenceDB, fencingKeyDB, lockerDB);
-            LOG.info("[MemoryRawKVStore] start successfully, options: {}.", opts);
-            return true;
-        } finally {
-            writeLock.unlock();
-        }
+        this.opts = opts;
+        LOG.info("[MemoryRawKVStore] start successfully, options: {}.", opts);
+        return true;
     }
 
     @Override
     public void shutdown() {
-        final Lock writeLock = this.readWriteLock.writeLock();
-        writeLock.lock();
-        try {
-            closeMemoryDB();
-        } finally {
-            writeLock.unlock();
-        }
+        this.defaultDB.clear();
+        this.sequenceDB.clear();
+        this.fencingKeyDB.clear();
+        this.lockerDB.clear();
     }
 
     @Override
     public KVIterator localIterator() {
-        final Lock readLock = this.readWriteLock.readLock();
-        readLock.lock();
-        try {
-            return new MemoryKVIterator(this, this.defaultDB, readLock, this.databaseVersion.get());
-        } finally {
-            readLock.unlock();
-        }
+        return new MemoryKVIterator(this.defaultDB);
     }
 
     @Override
@@ -124,7 +91,7 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             final byte[] value = this.defaultDB.get(key);
             setSuccess(closure, value);
         } catch (final Exception e) {
-            LOG.error("Fail to [GET], key: [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
+            LOG.error("Fail to [GET], key: [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
             setFailure(closure, "Fail to [GET]");
         } finally {
             timeCtx.stop();
@@ -154,7 +121,8 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
     }
 
     @Override
-    public void scan(final byte[] startKey, final byte[] endKey, final int limit, final boolean readOnlySafe,
+    public void scan(final byte[] startKey, final byte[] endKey, final int limit,
+                     @SuppressWarnings("unused") final boolean readOnlySafe, final boolean returnValue,
                      final KVStoreClosure closure) {
         final Timer.Context timeCtx = getTimeContext("SCAN");
         final List<KVEntry> entries = Lists.newArrayList();
@@ -173,14 +141,14 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
         }
         try {
             for (final Map.Entry<byte[], byte[]> entry : subMap.entrySet()) {
-                entries.add(new KVEntry(entry.getKey(), entry.getValue()));
+                entries.add(new KVEntry(entry.getKey(), returnValue ? entry.getValue() : null));
                 if (entries.size() >= maxCount) {
                     break;
                 }
             }
             setSuccess(closure, entries);
         } catch (final Exception e) {
-            LOG.error("Fail to [SCAN], range: ['[{}, {})'], {}.", Arrays.toString(startKey), Arrays.toString(endKey),
+            LOG.error("Fail to [SCAN], range: ['[{}, {})'], {}.", BytesUtil.toHex(startKey), BytesUtil.toHex(endKey),
                 StackTraceUtil.stackTrace(e));
             setFailure(closure, "Fail to [SCAN]");
         } finally {
@@ -195,13 +163,24 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             final ByteArray wrappedKey = ByteArray.wrap(seqKey);
             Long startVal = this.sequenceDB.get(wrappedKey);
             startVal = startVal == null ? 0 : startVal;
-            final long endVal = Math.max(startVal, (startVal + step) & Long.MAX_VALUE);
-            this.sequenceDB.put(wrappedKey, endVal);
+            if (step < 0) {
+                // never get here
+                setFailure(closure, "Fail to [GET_SEQUENCE], step must >= 0");
+                return;
+            }
+            if (step == 0) {
+                setSuccess(closure, new Sequence(startVal, startVal));
+                return;
+            }
+            final long endVal = getSafeEndValueForSequence(startVal, step);
+            if (startVal != endVal) {
+                this.sequenceDB.put(wrappedKey, endVal);
+            }
             setSuccess(closure, new Sequence(startVal, endVal));
         } catch (final Exception e) {
-            LOG.error("Fail to [GET_SEQUENCE], [key = {}, step = {}], {}.", Arrays.toString(seqKey), step,
+            LOG.error("Fail to [GET_SEQUENCE], [key = {}, step = {}], {}.", BytesUtil.toHex(seqKey), step,
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [GET_SEQUENCE]");
+            setCriticalError(closure, "Fail to [GET_SEQUENCE]", e);
         } finally {
             timeCtx.stop();
         }
@@ -214,9 +193,9 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             this.sequenceDB.remove(ByteArray.wrap(seqKey));
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [RESET_SEQUENCE], [key = {}], {}.", Arrays.toString(seqKey),
+            LOG.error("Fail to [RESET_SEQUENCE], [key = {}], {}.", BytesUtil.toHex(seqKey),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [RESET_SEQUENCE]");
+            setCriticalError(closure, "Fail to [RESET_SEQUENCE]", e);
         } finally {
             timeCtx.stop();
         }
@@ -229,9 +208,9 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             this.defaultDB.put(key, value);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [PUT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [PUT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT]");
+            setCriticalError(closure, "Fail to [PUT]", e);
         } finally {
             timeCtx.stop();
         }
@@ -244,9 +223,9 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             final byte[] prevVal = this.defaultDB.put(key, value);
             setSuccess(closure, prevVal);
         } catch (final Exception e) {
-            LOG.error("Fail to [GET_PUT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [GET_PUT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [GET_PUT]");
+            setCriticalError(closure, "Fail to [GET_PUT]", e);
         } finally {
             timeCtx.stop();
         }
@@ -269,9 +248,9 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             });
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [MERGE], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [MERGE], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                     StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [MERGE]");
+            setCriticalError(closure, "Fail to [MERGE]", e);
         } finally {
             timeCtx.stop();
         }
@@ -287,7 +266,7 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
             LOG.error("Failed to [PUT_LIST], [size = {}], {}.", entries.size(), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT_LIST]");
+            setCriticalError(closure, "Fail to [PUT_LIST]", e);
         } finally {
             timeCtx.stop();
         }
@@ -300,17 +279,17 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             final byte[] prevValue = this.defaultDB.putIfAbsent(key, value);
             setSuccess(closure, prevValue);
         } catch (final Exception e) {
-            LOG.error("Fail to [PUT_IF_ABSENT], [{}, {}], {}.", Arrays.toString(key), Arrays.toString(value),
+            LOG.error("Fail to [PUT_IF_ABSENT], [{}, {}], {}.", BytesUtil.toHex(key), BytesUtil.toHex(value),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [PUT_IF_ABSENT]");
+            setCriticalError(closure, "Fail to [PUT_IF_ABSENT]", e);
         } finally {
             timeCtx.stop();
         }
     }
 
     @Override
-    public void tryLockWith(final byte[] key, final boolean keepLease, final DistributedLock.Acquirer acquirer,
-                            final KVStoreClosure closure) {
+    public void tryLockWith(final byte[] key, final byte[] fencingKey, final boolean keepLease,
+                            final DistributedLock.Acquirer acquirer, final KVStoreClosure closure) {
         final Timer.Context timeCtx = getTimeContext("TRY_LOCK");
         try {
             // The algorithm relies on the assumption that while there is no
@@ -349,7 +328,7 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
                         // first time to acquire and success
                         .remainingMillis(DistributedLock.OwnerBuilder.FIRST_TIME_SUCCESS)
                         // create a new fencing token
-                        .fencingToken(getNextFencingToken(LOCK_FENCING_KEY))
+                        .fencingToken(getNextFencingToken(fencingKey))
                         // init acquires
                         .acquires(1)
                         // set acquirer ctx
@@ -388,7 +367,7 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
                         // success as a new acquirer
                         .remainingMillis(DistributedLock.OwnerBuilder.NEW_ACQUIRE_SUCCESS)
                         // create a new fencing token
-                        .fencingToken(getNextFencingToken(LOCK_FENCING_KEY))
+                        .fencingToken(getNextFencingToken(fencingKey))
                         // init acquires
                         .acquires(1)
                         // set acquirer ctx
@@ -458,8 +437,8 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
 
             setSuccess(closure, owner);
         } catch (final Exception e) {
-            LOG.error("Fail to [TRY_LOCK], [{}, {}], {}.", Arrays.toString(key), acquirer, StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [TRY_LOCK]");
+            LOG.error("Fail to [TRY_LOCK], [{}, {}], {}.", BytesUtil.toHex(key), acquirer, StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [TRY_LOCK]", e);
         } finally {
             timeCtx.stop();
         }
@@ -532,21 +511,21 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
 
             setSuccess(closure, owner);
         } catch (final Exception e) {
-            LOG.error("Fail to [RELEASE_LOCK], [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [RELEASE_LOCK]");
+            LOG.error("Fail to [RELEASE_LOCK], [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [RELEASE_LOCK]", e);
         } finally {
             timeCtx.stop();
         }
     }
 
-    @SuppressWarnings("SameParameterValue")
     private long getNextFencingToken(final byte[] fencingKey) {
         final Timer.Context timeCtx = getTimeContext("FENCING_TOKEN");
         try {
             // Don't worry about the token number overflow.
             // It takes about 290,000 years for the 1 million TPS system
             // to use the numbers in the range [0 ~ Long.MAX_VALUE].
-            return this.fencingKeyDB.compute(ByteArray.wrap(fencingKey), (key, prevVal) -> {
+            final byte[] realKey = BytesUtil.nullToEmpty(fencingKey);
+            return this.fencingKeyDB.compute(ByteArray.wrap(realKey), (key, prevVal) -> {
                 if (prevVal == null) {
                     return 1L;
                 }
@@ -564,8 +543,8 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             this.defaultDB.remove(key);
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [DELETE], [{}], {}.", Arrays.toString(key), StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [DELETE]");
+            LOG.error("Fail to [DELETE], [{}], {}.", BytesUtil.toHex(key), StackTraceUtil.stackTrace(e));
+            setCriticalError(closure, "Fail to [DELETE]", e);
         } finally {
             timeCtx.stop();
         }
@@ -581,9 +560,9 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
             }
             setSuccess(closure, Boolean.TRUE);
         } catch (final Exception e) {
-            LOG.error("Fail to [DELETE_RANGE], ['[{}, {})'], {}.", Arrays.toString(startKey), Arrays.toString(endKey),
+            LOG.error("Fail to [DELETE_RANGE], ['[{}, {})'], {}.", BytesUtil.toHex(startKey), BytesUtil.toHex(endKey),
                 StackTraceUtil.stackTrace(e));
-            setFailure(closure, "Fail to [DELETE_RANGE]");
+            setCriticalError(closure, "Fail to [DELETE_RANGE]", e);
         } finally {
             timeCtx.stop();
         }
@@ -635,205 +614,95 @@ public class MemoryRawKVStore extends BatchRawKVStore<MemoryDBOptions> {
     }
 
     @Override
-    public LocalFileMeta onSnapshotSave(final String snapshotPath) throws Exception {
-        final File file = new File(snapshotPath);
-        FileUtils.deleteDirectory(file);
-        FileUtils.forceMkdir(file);
-        writeToFile(snapshotPath, "sequenceDB", new SequenceDB(this.sequenceDB));
-        writeToFile(snapshotPath, "fencingKeyDB", new FencingKeyDB(this.fencingKeyDB));
-        writeToFile(snapshotPath, "lockerDB", new LockerDB(this.lockerDB));
-        final int size = this.opts.getKeysPerSegment();
-        final List<Pair<byte[], byte[]>> segment = Lists.newArrayListWithCapacity(size);
-        int index = 0;
-        for (final Map.Entry<byte[], byte[]> entry : this.defaultDB.entrySet()) {
-            segment.add(Pair.of(entry.getKey(), entry.getValue()));
-            if (segment.size() >= size) {
-                writeToFile(snapshotPath, "segment" + index++, new Segment(segment));
-                segment.clear();
-            }
-        }
-        if (!segment.isEmpty()) {
-            writeToFile(snapshotPath, "segment" + index++, new Segment(segment));
-        }
-        writeToFile(snapshotPath, "tailIndex", new TailIndex(--index));
-        return null;
-    }
-
-    @Override
-    public void onSnapshotLoad(final String snapshotPath, final LocalFileMeta meta) throws Exception {
-        final File file = new File(snapshotPath);
-        if (!file.exists()) {
-            LOG.error("Snapshot file [{}] not exists.", snapshotPath);
-            return;
-        }
-        final SequenceDB sequenceDB = readFromFile(snapshotPath, "sequenceDB", SequenceDB.class);
-        final FencingKeyDB fencingKeyDB = readFromFile(snapshotPath, "fencingKeyDB", FencingKeyDB.class);
-        final LockerDB lockerDB = readFromFile(snapshotPath, "lockerDB", LockerDB.class);
-        final TailIndex tailIndex = readFromFile(snapshotPath, "tailIndex", TailIndex.class);
-        final int tail = tailIndex.data();
-        final List<Segment> segments = Lists.newArrayListWithCapacity(tail + 1);
-        for (int i = 0; i <= tail; i++) {
-            final Segment segment = readFromFile(snapshotPath, "segment" + i, Segment.class);
-            segments.add(segment);
-        }
-        final ConcurrentNavigableMap<byte[], byte[]> defaultDB = new ConcurrentSkipListMap<>(COMPARATOR);
-        for (final Segment segment : segments) {
-            for (final Pair<byte[], byte[]> p : segment.data()) {
-                defaultDB.put(p.getKey(), p.getValue());
-            }
-        }
-        final Lock writeLock = this.readWriteLock.writeLock();
-        writeLock.lock();
+    public void initFencingToken(final byte[] parentKey, final byte[] childKey) {
+        final Timer.Context timeCtx = getTimeContext("INIT_FENCING_TOKEN");
         try {
-            closeMemoryDB();
-            openMemoryDB(this.opts, defaultDB, sequenceDB.data(), fencingKeyDB.data(), lockerDB.data());
+            final byte[] realKey = BytesUtil.nullToEmpty(parentKey);
+            final Long parentVal = this.fencingKeyDB.get(ByteArray.wrap(realKey));
+            if (parentVal == null) {
+                return;
+            }
+            this.fencingKeyDB.put(ByteArray.wrap(childKey), parentVal);
         } finally {
-            writeLock.unlock();
+            timeCtx.stop();
         }
     }
 
-    public long getDatabaseVersion() {
-        return this.databaseVersion.get();
-    }
-
-    private <T> void writeToFile(final String rootPath, final String fileName, final Persistence<T> persist)
-                                                                                                            throws Exception {
-        final Path path = Paths.get(rootPath, fileName);
-        try (final FileOutputStream out = new FileOutputStream(path.toFile());
-                final BufferedOutputStream bufOutput = new BufferedOutputStream(out)) {
-            final byte[] bytes = this.serializer.writeObject(persist);
-            final byte[] lenBytes = new byte[4];
-            Bits.putInt(lenBytes, 0, bytes.length);
-            bufOutput.write(lenBytes);
-            bufOutput.write(bytes);
-            bufOutput.flush();
-            out.getFD().sync();
-        }
-    }
-
-    private <T> T readFromFile(final String rootPath, final String fileName, final Class<T> clazz) throws Exception {
-        final Path path = Paths.get(rootPath, fileName);
-        final File file = path.toFile();
-        if (!file.exists()) {
-            throw new NoSuchFieldException(path.toString());
-        }
-        try (final FileInputStream in = new FileInputStream(file);
-                final BufferedInputStream bufInput = new BufferedInputStream(in)) {
-            final byte[] lenBytes = new byte[4];
-            int read = bufInput.read(lenBytes);
-            if (read != lenBytes.length) {
-                throw new IOException("fail to read snapshot file length, expects " + lenBytes.length
-                                      + " bytes, but read " + read);
-            }
-            final int len = Bits.getInt(lenBytes, 0);
-            final byte[] bytes = new byte[len];
-            read = bufInput.read(bytes);
-            if (read != bytes.length) {
-                throw new IOException("fail to read snapshot file, expects " + bytes.length + " bytes, but read "
-                                      + read);
-            }
-            return this.serializer.readObject(bytes, clazz);
-        }
-    }
-
-    private void openMemoryDB(final MemoryDBOptions opts, final ConcurrentNavigableMap<byte[], byte[]> defaultDB,
-                              final Map<ByteArray, Long> sequenceDB, final Map<ByteArray, Long> fencingKeyDB,
-                              final Map<ByteArray, DistributedLock.Owner> lockerDB) {
-        final Lock writeLock = this.readWriteLock.writeLock();
-        writeLock.lock();
+    void doSnapshotSave(final MemoryKVStoreSnapshotFile snapshotFile, final String snapshotPath, final Region region)
+                                                                                                                     throws Exception {
+        final Timer.Context timeCtx = getTimeContext("SNAPSHOT_SAVE");
         try {
-            this.databaseVersion.incrementAndGet();
-            this.opts = opts;
-            this.defaultDB = defaultDB;
-            this.sequenceDB = sequenceDB;
-            this.fencingKeyDB = fencingKeyDB;
-            this.lockerDB = lockerDB;
+            snapshotFile.writeToFile(snapshotPath, "sequenceDB", new SequenceDB(subRangeMap(this.sequenceDB, region)));
+            snapshotFile.writeToFile(snapshotPath, "fencingKeyDB",
+                new FencingKeyDB(subRangeMap(this.fencingKeyDB, region)));
+            snapshotFile.writeToFile(snapshotPath, "lockerDB", new LockerDB(subRangeMap(this.lockerDB, region)));
+            final int size = this.opts.getKeysPerSegment();
+            final List<Pair<byte[], byte[]>> segment = Lists.newArrayListWithCapacity(size);
+            int index = 0;
+            final byte[] realStartKey = BytesUtil.nullToEmpty(region.getStartKey());
+            final byte[] endKey = region.getEndKey();
+            final NavigableMap<byte[], byte[]> subMap;
+            if (endKey == null) {
+                subMap = this.defaultDB.tailMap(realStartKey);
+            } else {
+                subMap = this.defaultDB.subMap(realStartKey, endKey);
+            }
+            for (final Map.Entry<byte[], byte[]> entry : subMap.entrySet()) {
+                segment.add(Pair.of(entry.getKey(), entry.getValue()));
+                if (segment.size() >= size) {
+                    snapshotFile.writeToFile(snapshotPath, "segment" + index++, new Segment(segment));
+                    segment.clear();
+                }
+            }
+            if (!segment.isEmpty()) {
+                snapshotFile.writeToFile(snapshotPath, "segment" + index++, new Segment(segment));
+            }
+            snapshotFile.writeToFile(snapshotPath, "tailIndex", new TailIndex(--index));
         } finally {
-            writeLock.unlock();
+            timeCtx.stop();
         }
     }
 
-    private void closeMemoryDB() {
-        final Lock writeLock = this.readWriteLock.writeLock();
-        writeLock.lock();
+    void doSnapshotLoad(final MemoryKVStoreSnapshotFile snapshotFile, final String snapshotPath) throws Exception {
+        final Timer.Context timeCtx = getTimeContext("SNAPSHOT_LOAD");
         try {
-            if (this.defaultDB != null) {
-                this.defaultDB.clear();
+            final SequenceDB sequenceDB = snapshotFile.readFromFile(snapshotPath, "sequenceDB", SequenceDB.class);
+            final FencingKeyDB fencingKeyDB = snapshotFile.readFromFile(snapshotPath, "fencingKeyDB",
+                FencingKeyDB.class);
+            final LockerDB lockerDB = snapshotFile.readFromFile(snapshotPath, "lockerDB", LockerDB.class);
+
+            this.sequenceDB.putAll(sequenceDB.data());
+            this.fencingKeyDB.putAll(fencingKeyDB.data());
+            this.lockerDB.putAll(lockerDB.data());
+
+            final TailIndex tailIndex = snapshotFile.readFromFile(snapshotPath, "tailIndex", TailIndex.class);
+            final int tail = tailIndex.data();
+            final List<Segment> segments = Lists.newArrayListWithCapacity(tail + 1);
+            for (int i = 0; i <= tail; i++) {
+                final Segment segment = snapshotFile.readFromFile(snapshotPath, "segment" + i, Segment.class);
+                segments.add(segment);
             }
-            if (this.sequenceDB != null) {
-                this.sequenceDB.clear();
-            }
-            if (this.fencingKeyDB != null) {
-                this.fencingKeyDB.clear();
-            }
-            if (this.lockerDB != null) {
-                this.lockerDB.clear();
+            for (final Segment segment : segments) {
+                for (final Pair<byte[], byte[]> p : segment.data()) {
+                    this.defaultDB.put(p.getKey(), p.getValue());
+                }
             }
         } finally {
-            writeLock.unlock();
+            timeCtx.stop();
         }
     }
 
-    static class Persistence<T> {
-
-        private final T data;
-
-        public Persistence(T data) {
-            this.data = data;
+    static <V> Map<ByteArray, V> subRangeMap(final Map<ByteArray, V> input, final Region region) {
+        if (RegionHelper.isSingleGroup(region)) {
+            return input;
         }
-
-        public T data() {
-            return data;
+        final Map<ByteArray, V> output = new HashMap<>();
+        for (final Map.Entry<ByteArray, V> entry : input.entrySet()) {
+            final ByteArray key = entry.getKey();
+            if (RegionHelper.isKeyInRegion(key.getBytes(), region)) {
+                output.put(key, entry.getValue());
+            }
         }
-    }
-
-    /**
-     * The data of sequences
-     */
-    static class SequenceDB extends Persistence<Map<ByteArray, Long>> {
-
-        public SequenceDB(Map<ByteArray, Long> data) {
-            super(data);
-        }
-    }
-
-    /**
-     * The data of fencing token keys
-     */
-    static class FencingKeyDB extends Persistence<Map<ByteArray, Long>> {
-
-        public FencingKeyDB(Map<ByteArray, Long> data) {
-            super(data);
-        }
-    }
-
-    /**
-     * The data of lock info
-     */
-    static class LockerDB extends Persistence<Map<ByteArray, DistributedLock.Owner>> {
-
-        public LockerDB(Map<ByteArray, DistributedLock.Owner> data) {
-            super(data);
-        }
-    }
-
-    /**
-     * The data will be cut into many small portions, each called a segment
-     */
-    static class Segment extends Persistence<List<Pair<byte[], byte[]>>> {
-
-        public Segment(List<Pair<byte[], byte[]>> data) {
-            super(data);
-        }
-    }
-
-    /**
-     * The 'tailIndex' records the largest segment number (the segment number starts from 0)
-     */
-    static class TailIndex extends Persistence<Integer> {
-
-        public TailIndex(Integer data) {
-            super(data);
-        }
+        return output;
     }
 }

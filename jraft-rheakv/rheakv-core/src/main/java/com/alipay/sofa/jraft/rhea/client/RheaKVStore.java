@@ -162,6 +162,16 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
     CompletableFuture<List<KVEntry>> scan(final String startKey, final String endKey);
 
     /**
+     * Equivalent to {@code scan(startKey, endKey, readOnlySafe, true)}.
+     */
+    CompletableFuture<List<KVEntry>> scan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe);
+
+    /**
+     * @see #scan(byte[], byte[], boolean)
+     */
+    CompletableFuture<List<KVEntry>> scan(final String startKey, final String endKey, final boolean readOnlySafe);
+
+    /**
      * Query all data in the key of range [startKey, endKey).
      * <p>
      * Provide consistent reading if {@code readOnlySafe} is true.
@@ -174,15 +184,18 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
      *                     null means 'max-key' in the database.
      * @param readOnlySafe provide consistent reading if {@code readOnlySafe}
      *                     is true.
+     * @param returnValue  whether to return value.
      * @return a list where the key of range [startKey, endKey) passed by user
      * and value for {@code KVEntry}
      */
-    CompletableFuture<List<KVEntry>> scan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe);
+    CompletableFuture<List<KVEntry>> scan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe,
+                                          final boolean returnValue);
 
     /**
-     * @see #scan(byte[], byte[], boolean)
+     * @see #scan(byte[], byte[], boolean, boolean)
      */
-    CompletableFuture<List<KVEntry>> scan(final String startKey, final String endKey, final boolean readOnlySafe);
+    CompletableFuture<List<KVEntry>> scan(final String startKey, final String endKey, final boolean readOnlySafe,
+                                          final boolean returnValue);
 
     /**
      * @see #scan(byte[], byte[])
@@ -205,14 +218,38 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
     List<KVEntry> bScan(final String startKey, final String endKey, final boolean readOnlySafe);
 
     /**
+     * @see #scan(String, String, boolean, boolean)
+     */
+    List<KVEntry> bScan(final byte[] startKey, final byte[] endKey, final boolean readOnlySafe,
+                        final boolean returnValue);
+
+    /**
+     * @see #scan(String, String, boolean, boolean)
+     */
+    List<KVEntry> bScan(final String startKey, final String endKey, final boolean readOnlySafe,
+                        final boolean returnValue);
+
+    /**
      * Equivalent to {@code iterator(startKey, endKey, bufSize, true)}.
      */
     RheaIterator<KVEntry> iterator(final byte[] startKey, final byte[] endKey, final int bufSize);
 
     /**
-     * @see #iterator(byte[], byte[], int, boolean)
+     * @see #iterator(byte[], byte[], int)
      */
     RheaIterator<KVEntry> iterator(final String startKey, final String endKey, final int bufSize);
+
+    /**
+     * Equivalent to {@code iterator(startKey, endKey, bufSize, true, true)}.
+     */
+    RheaIterator<KVEntry> iterator(final byte[] startKey, final byte[] endKey, final int bufSize,
+                                   final boolean readOnlySafe);
+
+    /**
+     * @see #iterator(byte[], byte[], int, boolean)
+     */
+    RheaIterator<KVEntry> iterator(final String startKey, final String endKey, final int bufSize,
+                                   final boolean readOnlySafe);
 
     /**
      * Returns a remote iterator over the contents of the database.
@@ -228,21 +265,22 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
      *                     null means 'max-key' in the database.
      * @param readOnlySafe provide consistent reading if {@code readOnlySafe}
      *                     is true.
+     * @param returnValue  whether to return value.
      * @return a iterator where the key of range [startKey, endKey) passed by
      * user and value for {@code KVEntry}
      */
     RheaIterator<KVEntry> iterator(final byte[] startKey, final byte[] endKey, final int bufSize,
-                                   final boolean readOnlySafe);
+                                   final boolean readOnlySafe, final boolean returnValue);
 
     /**
-     * @see #iterator(byte[], byte[], int, boolean)
+     * @see #iterator(byte[], byte[], int, boolean, boolean)
      */
     RheaIterator<KVEntry> iterator(final String startKey, final String endKey, final int bufSize,
-                                   final boolean readOnlySafe);
+                                   final boolean readOnlySafe, final boolean returnValue);
 
     /**
      * Get a globally unique auto-increment sequence.
-     * <p>
+     *
      * Be careful do not to try to get or update the value of {@code seqKey}
      * by other methods, you won't get it.
      *
@@ -266,6 +304,33 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
      * @see #getSequence(byte[], int)
      */
     Sequence bGetSequence(final String seqKey, final int step);
+
+    /**
+     * Gets the latest sequence start value, this is a read-only operation.
+     *
+     * Equivalent to {@code getSequence(seqKey, 0)}.
+     *
+     * @see #getSequence(byte[], int)
+     *
+     * @param seqKey the key of sequence
+     * @return the latest sequence value
+     */
+    CompletableFuture<Long> getLatestSequence(final byte[] seqKey);
+
+    /**
+     * @see #getLatestSequence(byte[])
+     */
+    CompletableFuture<Long> getLatestSequence(final String seqKey);
+
+    /**
+     * @see #getLatestSequence(byte[])
+     */
+    Long bGetLatestSequence(final byte[] seqKey);
+
+    /**
+     * @see #getLatestSequence(byte[])
+     */
+    Long bGetLatestSequence(final String seqKey);
 
     /**
      * Reset the sequence to 0.
@@ -483,13 +548,13 @@ public interface RheaKVStore extends Lifecycle<RheaKVStoreOptions> {
      * every process flows approximately at the same rate, with an error
      * which is small compared to the auto-release time of the lock.
      *
-     * @param target    key of the distributed lock that acquired.
-     * @param lease     the lease time for the distributed lock to live.
-     * @param unit      the time unit of the {@code expire} argument.
-     * @param watchdog  if the watchdog is not null, it will auto keep
-     *                  lease of current lock, otherwise won't keep lease,
-     *                  this method dose not pay attention to the life cycle
-     *                  of watchdog, please maintain it yourself.
+     * @param target   key of the distributed lock that acquired.
+     * @param lease    the lease time for the distributed lock to live.
+     * @param unit     the time unit of the {@code expire} argument.
+     * @param watchdog if the watchdog is not null, it will auto keep
+     *                 lease of current lock, otherwise won't keep lease,
+     *                 this method dose not pay attention to the life cycle
+     *                 of watchdog, please maintain it yourself.
      * @return a distributed lock instance.
      */
     DistributedLock<byte[]> getDistributedLock(final byte[] target, final long lease, final TimeUnit unit,
