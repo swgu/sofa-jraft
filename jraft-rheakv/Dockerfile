@@ -17,10 +17,8 @@ ARG RHEAKV_VERSION
 
 WORKDIR /usr/local/rheakv
 
-COPY rheakv-server/target/jraft-rheakv-server-${RHEAKV_VERSION}/ .
-
 ENV SERVER_PORT=18181
-EVN PD_PORT=18182
+ENV PD_PORT=18182
 
 EXPOSE ${SERVER_PORT}
 EXPOSE ${PD_PORT}
@@ -28,8 +26,10 @@ EXPOSE ${PD_PORT}
 ENV RHEAKV_USER rheakv
 ENV USER rheakv:rheakv
 
+COPY rheakv-server/target/jraft-rheakv-server-${RHEAKV_VERSION}/ .
+
 RUN \
-    useradd $RHEAKV_USER && \
+    useradd -u 1000 $RHEAKV_USER && \
     [ `id -u $RHEAKV_USER` -eq 1000 ] && \
     [ `id -g $RHEAKV_USER` -eq 1000 ] && \
     chown -R "$RHEAKV_USER:$RHEAKV_USER" /usr/local/rheakv

@@ -13,7 +13,7 @@ build: mvn-package
 build-only:
 	docker build --build-arg RHEAKV_VERSION=${version} -t rheakv .
 run:
-	docker run -p 8181:8181 --user 1000:1000 --name=rheakv-container --rm -t rheakv:latest
+	docker run -p 18181:18181 --user 1000:1000 --name=rheakv-container --rm -t rheakv:latest
 
 # force-stop, just in case; container auto remove when stopped
 stop:
