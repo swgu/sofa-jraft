@@ -5,7 +5,6 @@ placementDriverOptions:
     rpcProcessorThreadPoolSize: 4
 storeEngineOptions:
   rocksDBOptions:
-    sync: true
     #dbPath: ${DB_PATH}
     dbPath: data/rhea_db
 
